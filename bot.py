@@ -20,12 +20,11 @@ from catalog import CATEGORIES, ITEMS, PROGRAMS
 load_dotenv()
 TOKEN = os.getenv('BOT_TOKEN', '')
 OWNER = int(os.getenv('OWNER_ID', '142840890'))
-DB_PATH = os.getenv('DB_PATH', 'hihi.sqlite3')
+DB_PATH = os.getenv('DB_PATH', 'hihi_v3.sqlite3')
 router = Router()
 SECTIONS = [('child', '🍟 Детский стол'), ('adult', '☕ Стол родителей'),
             ('entertainment', '🎭 Развлечения'), ('decor', '🎈 Оформление')]
-GROUPS = [('pizza', '🍕 Пицца'), ('snacks', '🍟 Закуски'), ('drinks', '🥤 Напитки'),
-          ('desserts', '🍰 Десерты'), ('coffee', '☕ Чай и кофе')]
+GROUPS = [('pizza', '🍕 Пицца'), ('snacks', '🍟 Закуски'), ('drinks', '🥤 Напитки')]
 
 class Form(StatesGroup):
     children = State()
@@ -35,6 +34,7 @@ class Form(StatesGroup):
     admin_edit = State()
     admin_add = State()
     admin_target = State()
+    drink_quantity = State()
 
 
 def db():
@@ -61,16 +61,6 @@ def init_db():
             c.executemany('INSERT INTO categories(id,title) VALUES(?,?)', CATEGORIES)
             c.executemany('INSERT INTO items(category,name,price,description) VALUES(?,?,?,?)', ITEMS)
         c.execute('INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)', ('recipient',str(OWNER)))
-        # Migrate the original single-section draft carts without dropping or altering them.
-        if c.execute("SELECT 1 FROM settings WHERE key='v2_cart_migrated'").fetchone() is None:
-            c.execute('''INSERT OR IGNORE INTO cart_v2(user_id,section,item_id,quantity)
-                         SELECT c.user_id,CASE WHEN i.category IN ('entertainment','decor') THEN i.category ELSE 'child' END,c.item_id,c.quantity
-                         FROM carts c JOIN items i ON i.id=c.item_id''')
-            c.execute("INSERT INTO settings(key,value) VALUES('v2_cart_migrated','1')")
-        # Only move the original seeded balloon; do not overwrite administrator edits.
-        if c.execute("SELECT 1 FROM settings WHERE key='v2_balloon_moved'").fetchone() is None:
-            c.execute("UPDATE items SET active=0 WHERE category='decor' AND name='Шар для моделирования'")
-            c.execute("INSERT INTO settings(key,value) VALUES('v2_balloon_moved','1')")
         for r in c.execute('SELECT id,category,name,description FROM items').fetchall():
             rule,unit,per = infer_rule(r)
             c.execute('INSERT OR IGNORE INTO item_rules(item_id,rule,unit,per_child) VALUES(?,?,?,?)',(r['id'],rule,unit,per))
@@ -88,8 +78,8 @@ def infer_rule(item):
     if n.startswith('наггетсы'): return ('quantity','порц.',1)
     if n.startswith('картофель'): return ('quantity','порц.',1)
     if cat=='pizza': return ('quantity','шт.',0)
-    if cat=='snacks': return ('quantity','порц.',0)
-    if cat=='desserts' and ('мороженое' in n or 'блинчики' in n): return ('quantity','порц.',1)
+    if cat=='snacks': return ('quantity','порц.',n in ('блинчики с топпингом','канапе'))
+    if cat=='drinks' and (n.startswith('сок ') or n.startswith('вода ')) and ('0,2 л' in n or '0,5 л' in n): return ('quantity','шт.',1)
     return ('quantity','шт.',0)
 
 
@@ -107,8 +97,9 @@ def keyboard(rows):
 async def show(q,text,buttons):
     try:
         await q.message.edit_text(text,reply_markup=keyboard(buttons),parse_mode='HTML')
-    except Exception:
-        await q.message.answer(text,reply_markup=keyboard(buttons),parse_mode='HTML')
+    except Exception as exc:
+        if 'message is not modified' not in str(exc).lower():
+            await q.message.answer(text,reply_markup=keyboard(buttons),parse_mode='HTML')
     await q.answer()
 
 
@@ -138,12 +129,19 @@ def get_item(iid):
 def items_for(section,group=None,page=0):
     if section in ('child','adult'):
         if group not in {g for g,_ in GROUPS}:return [],0
-        # Children's menu includes cup tea, but not coffee or teapot tea.
-        where="i.category=? AND i.active=1 AND i.name NOT IN ('Наггетсы 4 шт.','Наггетсы 6 шт.')"; args=[group]
-        if section=='child':
-            where += " AND (i.category!='coffee' OR i.name='Чай 180 мл')"
+        where="i.category=? AND i.active=1";args=[group]
+        if group=='pizza':
+            where += " AND i.name LIKE '%25 см'"  # one entry per flavor, menu uses size-first
+        if group=='snacks':
+            where += " AND i.name NOT LIKE 'Наггетсы %'"
+        if group=='drinks':
+            where += " AND i.name NOT LIKE 'Сок %' AND i.name NOT LIKE 'Вода %'"
+            if section=='child':
+                where += " AND i.name IN ('Чай 180 мл','Детское шампанское')"
+            else:
+                where += " AND i.name NOT IN ('Американо','Капучино','Глясе','Латте','Эспрессо')"
     else:
-        where='i.category=? AND i.active=1'; args=[section]
+        where='i.category=? AND i.active=1';args=[section]
     with db() as c:
         count=c.execute(f'SELECT COUNT(*) n FROM items i WHERE {where}',args).fetchone()['n']
         rows=c.execute(f'SELECT i.* FROM items i WHERE {where} ORDER BY i.id LIMIT 7 OFFSET ?',(*args,page*7)).fetchall()
@@ -151,7 +149,7 @@ def items_for(section,group=None,page=0):
 
 def listing(section,group,page=0):
     rows,count=items_for(section,group,page)
-    buttons=[[(('Наггетсы — выбрать порции и размер' if r['name'].startswith('Наггетсы') else f'{r["name"][:37]} — {r["price"]} ₽'),f'item:{section}:{r["id"]}')] for r in rows]
+    buttons=[[(f'{r["name"][:37]} — {r["price"]} ₽',f'item:{section}:{r["id"]}')] for r in rows]
     navrow=[]
     if page>0:navrow.append(('◀️',f'list:{section}:{group}:{page-1}'))
     if (page+1)*7<count:navrow.append(('▶️',f'list:{section}:{group}:{page+1}'))
@@ -177,7 +175,7 @@ def add_line(uid,section,iid,qty,units=1):
 
 def cart_rows(uid):
     with db() as c:
-        return c.execute('''SELECT v.section,v.item_id,v.quantity,v.units,i.name,i.price,
+        return c.execute('''SELECT v.section,v.item_id,v.quantity,v.units,i.name,i.price,i.description,
                               COALESCE(r.rule,'quantity') rule,COALESCE(r.unit,'шт.') unit
                               FROM cart_v2 v JOIN items i ON i.id=v.item_id
                               LEFT JOIN item_rules r ON r.item_id=i.id
@@ -204,6 +202,8 @@ def cart_text(uid,admin=False):
             elif r['rule']=='single':details='1 усл.'
             else:details=f'{r["quantity"]} {r["unit"]} × {r["price"]} ₽'
             lines.append(f'• {escape(r["name"])} — {details} = {line_sum(r)} ₽')
+            if r['section'] in ('entertainment','decor') and r['description']:
+                lines.append(f'  <i>{escape(r["description"][:110])}</i>')
         lines.append(f'<i>Подытог: {sum(line_sum(r) for r in selected)} ₽</i>')
     if not rows:lines.append('\nПока ничего не выбрано.')
     total=sum(line_sum(r) for r in rows)
@@ -212,28 +212,34 @@ def cart_text(uid,admin=False):
     return '\n'.join(lines),total
 
 def cart_buttons(uid):
-    rows=cart_rows(uid)
-    buttons=[]
+    rows=cart_rows(uid);buttons=[]
     for r in rows:
         section,iid=r['section'],r['item_id']
-        if r['rule']=='hours':
-            buttons.append([(f'⏱ {r["name"][:17]} −1 ч',f'adj:{section}:{iid}:u-'),('＋1 ч',f'adj:{section}:{iid}:u+')])
-        elif r['rule']=='room':
-            buttons.append([(f'🧸 Детей −',f'adj:{section}:{iid}:q-'),('Детей +',f'adj:{section}:{iid}:q+')])
-            buttons.append([('⏱ −30 мин',f'adj:{section}:{iid}:u-'),('＋30 мин',f'adj:{section}:{iid}:u+')])
+        if r['rule']=='room':
+            buttons.append([('➖',f'adj:{section}:{iid}:q-'),(f'👧 {r["quantity"]} дет.',f'noop'),('➕',f'adj:{section}:{iid}:q+')])
+            buttons.append([('⏱ −30 мин',f'adj:{section}:{iid}:u-'),(f'{r["units"]*30} мин', 'noop'),('⏱ +30 мин',f'adj:{section}:{iid}:u+')])
+        elif r['rule']=='hours':
+            buttons.append([('➖',f'adj:{section}:{iid}:u-'),(f'{r["name"][:19]} · {r["units"]} ч.', 'noop'),('➕',f'adj:{section}:{iid}:u+')])
+            buttons.append([('🗑 Удалить услугу',f'drop:{section}:{iid}')])
         elif r['rule']=='single':
-            buttons.append([(f'🗑 {r["name"][:25]}',f'drop:{section}:{iid}')])
+            buttons.append([('🗑 '+r['name'][:26],f'drop:{section}:{iid}')])
         else:
-            buttons.append([(f'− {r["name"][:22]}',f'adj:{section}:{iid}:q-'),('＋',f'adj:{section}:{iid}:q+')])
+            buttons.append([('➖',f'adj:{section}:{iid}:q-'),(f'{r["name"][:18]} · {r["quantity"]}', 'noop'),('➕',f'adj:{section}:{iid}:q+')])
     buttons.extend([[('➕ Добавить позиции','sections')],[('👧 Изменить число детей','children')]])
     if rows:buttons.extend([[('📨 Отправить заявку','submit')],[('🗑 Очистить смету','clearask')]])
-    buttons.append([('🏠 Главное меню','home')])
+    buttons.append([('🔄 Начать всё заново','restartask')]);buttons.append([('🏠 Главное меню','home')])
     return buttons
+
+@router.callback_query(F.data=='noop')
+async def noop(q:CallbackQuery):await q.answer()
 
 @router.message(CommandStart())
 async def start(m:Message,state:FSMContext):
     await state.clear()
-    await m.answer('🎉 Добро пожаловать в кафе «Хи-Хи»!\nСоберите детский праздник и узнайте стоимость.',reply_markup=keyboard(home(m.from_user.id)))
+    if not party(m.from_user.id) or not party(m.from_user.id)['children']:
+        await state.set_state(Form.children)
+        return await m.answer('🎉 Сколько детей будет на празднике? (от 1 до 30)')
+    await m.answer('🎉 Выберите всё для праздника:',reply_markup=keyboard([[ (label,f'section:{key}') ] for key,label in SECTIONS]+nav(m.from_user.id)))
 
 @router.message(Command('myid'))
 async def myid(m:Message):await m.answer(f'Ваш Telegram ID: <code>{m.from_user.id}</code>',parse_mode='HTML')
@@ -250,20 +256,20 @@ async def go_home(q:CallbackQuery,state:FSMContext):
 async def begin(q:CallbackQuery):
     if party(q.from_user.id) and party(q.from_user.id)['children']>0:
         return await show(q,'Выберите раздел праздника:',[[ (label,f'section:{key}') ] for key,label in SECTIONS]+nav(q.from_user.id))
-    await show(q,'Сколько детей будет на празднике?',[[('👧 Указать количество детей','children')]]+nav(q.from_user.id))
+    await show(q,'Сколько детей будет на празднике? (от 1 до 30)',[[('👧 Указать количество детей','children')]])
 
 @router.callback_query(F.data=='children')
 async def children(q:CallbackQuery,state:FSMContext):
     await state.set_state(Form.children)
-    await q.message.answer('👧 Сколько детей будет на празднике? Отправьте число (от 1 до 1000).')
+    await q.message.answer('👧 Сколько детей будет на празднике? (от 1 до 30)')
     await q.answer()
 
 @router.message(Form.children,F.text)
 async def children_value(m:Message,state:FSMContext):
-    if not m.text.strip().isdigit() or not 1<=int(m.text.strip())<=1000:return await m.answer('Введите число от 1 до 1000.')
+    if not m.text.strip().isdigit() or not 1<=int(m.text.strip())<=30:return await m.answer('Введите число от 1 до 30.')
     set_party(m.from_user.id,'children',int(m.text.strip()))
     await state.clear()
-    await m.answer('Количество детей сохранено. Ничего автоматически не добавлено.',reply_markup=keyboard([[('🎉 Выбрать разделы','sections')],[('🧾 Моя смета','cart')]]))
+    await m.answer('🎉 Выберите всё для праздника:',reply_markup=keyboard([[(label,f'section:{key}')] for key,label in SECTIONS]+nav(m.from_user.id)))
 
 @router.callback_query(F.data=='sections')
 async def sections(q:CallbackQuery):
@@ -273,7 +279,8 @@ async def sections(q:CallbackQuery):
 async def section(q:CallbackQuery):
     key=q.data.split(':')[1]
     if key in ('child','adult'):
-        buttons=[[(title,f'list:{key}:{g}:0')] for g,title in GROUPS if True]
+        buttons=[[(title, f'pizzasize:{key}' if g=='pizza' else f'list:{key}:{g}:0')] for g,title in GROUPS]
+        buttons.insert(1,[('🍗 Наггетсы',f'nugstart:{key}')])
         buttons += [[('🧾 Моя смета','cart')],[('⬅️ Разделы','sections')]]
     elif key in ('entertainment','decor'):
         buttons=listing(key,key)
@@ -283,34 +290,137 @@ async def section(q:CallbackQuery):
 @router.callback_query(F.data.startswith('list:'))
 async def list_items(q:CallbackQuery):
     _,section,group,page=q.data.split(':')
+    if group=='drinks':
+        buttons=[[('🧃 Сок','drinkvol:'+section+':juice')],[('💧 Вода','drinkvol:'+section+':water')]]
+        if section=='adult':buttons += [[('☕ Кофе','coffee:'+section)]]
+        buttons += listing(section,group,int(page))
+        return await show(q,'🥤 Выберите напиток:',buttons)
     await show(q,'Выберите позицию:',listing(section,group,int(page)))
+
+def chosen_controls(uid,section,r,back=None):
+    with db() as c:
+        row=c.execute('SELECT quantity,units FROM cart_v2 WHERE user_id=? AND section=? AND item_id=?',(uid,section,r['id'])).fetchone()
+    qty=row['quantity'] if row else 0
+    buttons=[]
+    if r['rule']=='quantity':
+        buttons.append([('➖',f'adjitem:{section}:{r["id"]}:-'),(f'{qty} {r["unit"]}', 'noop'),('➕',f'adjitem:{section}:{r["id"]}:+')])
+    if back:buttons.append([('⬅️ Продолжить выбор',back)])
+    buttons.append([('🧾 Моя смета','cart')])
+    return buttons
+
+def chosen_text(uid,section,r):
+    with db() as c:
+        row=c.execute('SELECT quantity FROM cart_v2 WHERE user_id=? AND section=? AND item_id=?',(uid,section,r['id'])).fetchone()
+    qty=row['quantity'] if row else 0
+    return f'✅ <b>{escape(r["name"])}</b>\nВ смете: {qty} {escape(r["unit"])} × {r["price"]} ₽ = {qty*r["price"]} ₽'
+
+@router.callback_query(F.data.startswith('pizzasize:'))
+async def pizza_size(q:CallbackQuery):
+    section=q.data.split(':')[1]
+    await show(q,'🍕 Выберите размер пиццы:',[[('25 см — 700 ₽',f'pizzaflav:{section}:25')],[('30 см — 850 ₽',f'pizzaflav:{section}:30')],[('⬅️ Назад',f'section:{section}')]])
+
+@router.callback_query(F.data.startswith('pizzaflav:'))
+async def pizza_flavors(q:CallbackQuery):
+    _,section,size=q.data.split(':')
+    with db() as c:rows=c.execute('SELECT id,name FROM items WHERE category=? AND active=1 AND name LIKE ? ORDER BY id',('pizza',f'% {size} см')).fetchall()
+    buttons=[[(r['name'].replace('Пицца ','').replace(f' {size} см',''),f'pizzaadd:{section}:{r["id"]}:{size}')] for r in rows]
+    buttons += [[('🧾 Моя смета','cart')],[('⬅️ Размер',f'pizzasize:{section}')]]
+    await show(q,f'🍕 Пицца {size} см. Нажимайте на вкусы: каждое нажатие добавляет 1 пиццу.\n',buttons)
+
+@router.callback_query(F.data.startswith('pizzaadd:'))
+async def pizza_add(q:CallbackQuery):
+    _,section,raw,size=q.data.split(':');r=get_item(int(raw))
+    if not r or not r['active'] or r['category']!='pizza':return await q.answer('Недоступно',show_alert=True)
+    add_line(q.from_user.id,section,r['id'],1)
+    with db() as c:rows=c.execute('SELECT id,name FROM items WHERE category=? AND active=1 AND name LIKE ? ORDER BY id',('pizza',f'% {size} см')).fetchall()
+    buttons=[[(r2['name'].replace('Пицца ','').replace(f' {size} см',''),f'pizzaadd:{section}:{r2["id"]}:{size}')] for r2 in rows]
+    buttons += [[('🧾 Моя смета','cart')],[('⬅️ Размер',f'pizzasize:{section}')]]
+    await show(q,f'✅ Добавлена: {escape(r["name"])}.\nМожно нажать на тот же вкус ещё раз или выбрать другой:',buttons)
+
+@router.callback_query(F.data.startswith('nugstart:'))
+async def nug_start(q:CallbackQuery):
+    section=q.data.split(':')[1]
+    with db() as c:r=c.execute("SELECT id FROM items WHERE name='Наггетсы 2 шт.' AND active=1").fetchone()
+    if not r:return await q.answer('Наггетсы недоступны',show_alert=True)
+    await show(q,'🍗 Сколько порций наггетсов нужно?',[[('👧 По количеству детей',f'pick:{section}:{r["id"]}:kids')],[('✏️ Своё количество',f'pick:{section}:{r["id"]}:manual')],[('⬅️ Назад',f'section:{section}')]])
+
+@router.callback_query(F.data.startswith('coffee:'))
+async def coffee(q:CallbackQuery):
+    section=q.data.split(':')[1]
+    if section!='adult':return await q.answer('Только для родителей',show_alert=True)
+    with db() as c:rows=c.execute("SELECT id,name,price FROM items WHERE category='drinks' AND active=1 AND name IN ('Американо','Капучино','Глясе','Латте','Эспрессо') ORDER BY id").fetchall()
+    await show(q,'☕ Выберите кофе:',[[(f'{r["name"]} — {r["price"]} ₽',f'item:{section}:{r["id"]}')] for r in rows]+[[('⬅️ Напитки',f'list:{section}:drinks:0')]])
+
+@router.callback_query(F.data.startswith('drinkvol:'))
+async def drink_vol(q:CallbackQuery):
+    _,section,kind=q.data.split(':')
+    sizes=[('0,2 л',60),('1 л',250)] if kind=='juice' else [('0,5 л',60),('1,5 л',120)]
+    await show(q,'Выберите объём:',[[(f'{size} — {price} ₽',f'drinkvariant:{section}:{kind}:{"small" if i==0 else "large"}')] for i,(size,price) in enumerate(sizes)]+[[('⬅️ Напитки',f'list:{section}:drinks:0')]])
+
+@router.callback_query(F.data.startswith('drinkvariant:'))
+async def drink_variant(q:CallbackQuery):
+    _,section,kind,size=q.data.split(':')
+    vol=('0,2 л' if size=='small' else '1 л') if kind=='juice' else ('0,5 л' if size=='small' else '1,5 л')
+    with db() as c:rows=c.execute('SELECT id,name FROM items WHERE category=? AND active=1 AND name LIKE ? ORDER BY id',('drinks',('Сок %' if kind=='juice' else 'Вода %')+'%'+vol)).fetchall()
+    buttons=[[(r['name'].replace('Сок ','').replace('Вода ','').replace(', '+vol,''),f'drinkpick:{section}:{r["id"]}:{kind}:{size}')] for r in rows]
+    buttons += [[('🧾 Моя смета','cart')],[('⬅️ Объём',f'drinkvol:{section}:{kind}')]]
+    await show(q,'Выберите '+('вкус сока:' if kind=='juice' else 'тип воды:'),buttons)
+
+@router.callback_query(F.data.startswith('drinkpick:'))
+async def drink_pick(q:CallbackQuery,state:FSMContext):
+    _,section,raw,kind,size=q.data.split(':');r=get_item(int(raw))
+    if not r or not r['active'] or r['category']!='drinks':return await q.answer('Недоступно',show_alert=True)
+    if size=='small':
+        p=party(q.from_user.id);n=p['children'] if p else 0
+        return await show(q,f'{escape(r["name"])}. Сколько упаковок добавить?',[[ (f'👧 По количеству детей — {n}',f'drinkadd:{section}:{r["id"]}:{n}:{kind}:{size}') ],[('✏️ Своё количество',f'drinkmanual:{section}:{r["id"]}:{kind}:{size}')],[('⬅️ Назад',f'drinkvariant:{section}:{kind}:{size}')]])
+    add_line(q.from_user.id,section,r['id'],1)
+    await show(q,chosen_text(q.from_user.id,section,r),chosen_controls(q.from_user.id,section,r,f'drinkvariant:{section}:{kind}:{size}'))
+
+@router.callback_query(F.data.startswith('drinkadd:'))
+async def drink_add(q:CallbackQuery):
+    _,section,raw,qty,kind,size=q.data.split(':');r=get_item(int(raw))
+    if not r or not r['active']:return await q.answer('Недоступно',show_alert=True)
+    add_line(q.from_user.id,section,r['id'],int(qty))
+    await show(q,chosen_text(q.from_user.id,section,r),chosen_controls(q.from_user.id,section,r,f'drinkvariant:{section}:{kind}:{size}'))
+
+@router.callback_query(F.data.startswith('drinkmanual:'))
+async def drink_manual(q:CallbackQuery,state:FSMContext):
+    _,section,raw,kind,size=q.data.split(':')
+    await state.set_state(Form.quantity);await state.update_data(section=section,iid=int(raw),back=f'drinkvariant:{section}:{kind}:{size}')
+    await q.message.answer('Сколько упаковок добавить? Отправьте число от 1 до 1000.')
+    await q.answer()
 
 @router.callback_query(F.data.startswith('item:'))
 async def item(q:CallbackQuery):
     _,section,raw=q.data.split(':');r=get_item(int(raw))
     if not r or not r['active']:return await q.answer('Позиция недоступна',show_alert=True)
     if section in ('child','adult') and r['category'] not in {g for g,_ in GROUPS}:return await q.answer('Недоступно',show_alert=True)
-    if section=='child' and r['category']=='coffee' and r['name']!='Чай 180 мл':return await q.answer('Недоступно для детского стола',show_alert=True)
+    if section=='child' and r['category']=='drinks' and r['name'] not in ('Чай 180 мл','Детское шампанское') and not r['name'].startswith(('Вода ','Сок ')):return await q.answer('Недоступно',show_alert=True)
     if section in ('entertainment','decor') and r['category']!=section:return await q.answer('Недоступно',show_alert=True)
-    name='Наггетсы' if r['name'].startswith('Наггетсы') else r['name']
-    txt=(f'<b>Наггетсы</b>\nРазмер порции: 2, 4 или 6 шт.\nСтоимость: 80 / 120 / 150 ₽ за порцию.' if r['name'].startswith('Наггетсы') else f'<b>{escape(name)}</b>\n{escape(r["description"] or "Описание в прайсе не указано.")}\nЦена: {r["price"]} ₽')
-    if r['rule']=='hours':txt+='\nПродолжительность: 1 час; каждый дополнительный час по той же цене.'
-    if r['rule']=='room':txt+='\n150 ₽ за ребёнка за каждые 30 минут.'
+    if r['rule'] in ('single','hours'):
+        added=add_line(q.from_user.id,section,r['id'],1)
+        msg=('✅ Добавлено: ' if added else 'Уже в смете: ')+escape(r['name'])
+        return await show(q,msg,[[('➕ Ещё услуги',f'section:{section}')],[('🧾 Моя смета','cart')]])
+    if r['rule']=='room' or r['per_child']:
+        p=party(q.from_user.id);n=p['children'] if p else 0
+        return await show(q,f'<b>{escape(r["name"])}</b> — {r["price"]} ₽\nСколько добавить?',[[ (f'👧 По количеству детей — {n}',f'pick:{section}:{r["id"]}:kids') ],[('✏️ Своё количество',f'pick:{section}:{r["id"]}:manual')],[('⬅️ Назад',f'section:{section}' if section in ('entertainment','decor') else f'list:{section}:{r["category"]}:0')]])
+    add_line(q.from_user.id,section,r['id'],1)
+    back=f'section:{section}' if section in ('entertainment','decor') else (f'coffee:{section}' if r['name'] in ('Американо','Капучино','Глясе','Латте','Эспрессо') else f'list:{section}:{r["category"]}:0')
+    await show(q,chosen_text(q.from_user.id,section,r),chosen_controls(q.from_user.id,section,r,back))
+
+@router.callback_query(F.data.startswith('adjitem:'))
+async def adjust_item(q:CallbackQuery):
+    _,section,raw,op=q.data.split(':');iid=int(raw);r=get_item(iid)
+    if not r:return await q.answer('Не найдено',show_alert=True)
     with db() as c:
-        exists=c.execute('SELECT * FROM cart_v2 WHERE user_id=? AND section=? AND item_id=?',(q.from_user.id,section,r['id'])).fetchone()
-    if exists and r['rule'] in ('hours','room'):
-        if r['rule']=='hours':
-            return await show(q,txt+'\n\nУслуга уже в смете. Добавить дополнительный час?',[[('⏱ Да, ещё 1 час',f'add:{section}:{r["id"]}:1:1')],[('Нет, оставить','cart')]])
-        return await show(q,txt+'\n\nИгровая комната уже в смете. Продлить на 30 минут?',[[('⏱ Да, ещё 30 минут',f'add:{section}:{r["id"]}:1:1')],[('🧾 Открыть смету','cart')]])
-    if exists and r['rule']=='single':return await show(q,txt+'\n\nУслуга уже добавлена.',nav(q.from_user.id))
-    if r['rule']=='single' or r['rule']=='hours':
-        buttons=[[('➕ Добавить услугу',f'add:{section}:{r["id"]}:1:1')]]
-    else:
-        buttons=[[('👧 По количеству детей',f'pick:{section}:{r["id"]}:kids')]] if r['per_child'] else []
-        buttons.append([('✏️ Указать количество',f'pick:{section}:{r["id"]}:manual')])
-    back=f'section:{section}' if section in ('entertainment','decor') else f'list:{section}:{r["category"]}:0'
-    buttons += [[('🧾 Моя смета','cart')],[('⬅️ Назад',back)]]
-    await show(q,txt,buttons)
+        row=c.execute('SELECT quantity FROM cart_v2 WHERE user_id=? AND section=? AND item_id=?',(q.from_user.id,section,iid)).fetchone()
+        if op=='+':
+            if row:c.execute('UPDATE cart_v2 SET quantity=quantity+1 WHERE user_id=? AND section=? AND item_id=?',(q.from_user.id,section,iid))
+            else:c.execute('INSERT INTO cart_v2(user_id,section,item_id,quantity) VALUES(?,?,?,1)',(q.from_user.id,section,iid))
+        elif row:
+            if row['quantity']==1:c.execute('DELETE FROM cart_v2 WHERE user_id=? AND section=? AND item_id=?',(q.from_user.id,section,iid))
+            else:c.execute('UPDATE cart_v2 SET quantity=quantity-1 WHERE user_id=? AND section=? AND item_id=?',(q.from_user.id,section,iid))
+    await show(q,chosen_text(q.from_user.id,section,r),chosen_controls(q.from_user.id,section,r,(f'coffee:{section}' if r['name'] in ('Американо','Капучино','Глясе','Латте','Эспрессо') else f'list:{section}:{r["category"]}:0')))
 
 @router.callback_query(F.data.startswith('pick:'))
 async def pick(q:CallbackQuery,state:FSMContext):
@@ -326,10 +436,10 @@ async def pick(q:CallbackQuery,state:FSMContext):
             await show(q,f'Выбрано {quantity} порций. Сколько наггетсов в каждой порции?',nugget_buttons(section,quantity))
         else:
             add_line(q.from_user.id,section,iid,quantity)
-            await show(q,f'Добавлено: {quantity} {escape(r["unit"])}. Продолжайте выбирать.',after_add(section,r))
+            await show(q,chosen_text(q.from_user.id,section,r),chosen_controls(q.from_user.id,section,r,f'section:{section}' if section in ('entertainment','decor') else f'list:{section}:{r["category"]}:0'))
     else:
         await state.set_state(Form.quantity)
-        await state.update_data(section=section,iid=iid)
+        await state.update_data(section=section,iid=iid,back=f'section:{section}' if section in ('entertainment','decor') else f'list:{section}:{r["category"]}:0')
         await q.message.answer('Сколько порций / штук / человек нужно? Отправьте целое число от 1 до 1000.')
         await q.answer()
 
@@ -348,14 +458,14 @@ async def quantity_value(m:Message,state:FSMContext):
     if r['name'].startswith('Наггетсы'):
         return await m.answer(f'Выбрано {qty} порций. Сколько наггетсов в порции?',reply_markup=keyboard(nugget_buttons(section,qty)))
     add_line(m.from_user.id,section,iid,qty)
-    await m.answer(f'Добавлено: {qty} {r["unit"]}.',reply_markup=keyboard(after_add(section,r)))
+    await m.answer(chosen_text(m.from_user.id,section,r),reply_markup=keyboard(chosen_controls(m.from_user.id,section,r,data.get('back'))),parse_mode='HTML')
 
 @router.callback_query(F.data.startswith('nug:'))
 async def nugget_choice(q:CallbackQuery):
     _,section,raw,rawqty=q.data.split(':');iid=int(raw);qty=int(rawqty);r=get_item(iid)
     if not r or not r['active'] or not r['name'].startswith('Наггетсы'):return await q.answer('Недоступно',show_alert=True)
     add_line(q.from_user.id,section,iid,qty)
-    await show(q,f'🍗 Добавлено: {qty} порций «{escape(r["name"])}».',after_add(section,r))
+    await show(q,chosen_text(q.from_user.id,section,r),chosen_controls(q.from_user.id,section,r,f'nugstart:{section}'))
 
 def after_add(section,r):
     back=f'section:{section}' if section in ('entertainment','decor') else f'list:{section}:{r["category"]}:0'
@@ -404,6 +514,18 @@ async def clearconfirm(q:CallbackQuery):
         c.execute('DELETE FROM cart_v2 WHERE user_id=?',(q.from_user.id,))
         c.execute('DELETE FROM party WHERE user_id=?',(q.from_user.id,))
     await show(q,'Смета очищена.',home(q.from_user.id))
+
+@router.callback_query(F.data=='restartask')
+async def restart_ask(q:CallbackQuery):
+    await show(q,'🔄 Начать всё заново? Смета и количество детей будут сброшены.',[[('Да, начать заново','restartconfirm')],[('Нет, вернуться','cart')]])
+
+@router.callback_query(F.data=='restartconfirm')
+async def restart_confirm(q:CallbackQuery,state:FSMContext):
+    with db() as c:
+        c.execute('DELETE FROM cart_v2 WHERE user_id=?',(q.from_user.id,))
+        c.execute('DELETE FROM party WHERE user_id=?',(q.from_user.id,))
+    await state.set_state(Form.children)
+    await show(q,'🎉 Сколько детей будет на празднике? (от 1 до 30)',[])
 
 @router.callback_query(F.data=='submit')
 async def submit(q:CallbackQuery,state:FSMContext):
