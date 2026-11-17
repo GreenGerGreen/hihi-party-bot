@@ -13,7 +13,7 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ForceReply
 from dotenv import load_dotenv
 from catalog import CATEGORIES, ITEMS, PROGRAMS
 
@@ -219,12 +219,12 @@ def cart_buttons(uid):
             buttons.append([('➖',f'adj:{section}:{iid}:q-'),(f'👧 {r["quantity"]} дет.',f'noop'),('➕',f'adj:{section}:{iid}:q+')])
             buttons.append([('⏱ −30 мин',f'adj:{section}:{iid}:u-'),(f'{r["units"]*30} мин', 'noop'),('⏱ +30 мин',f'adj:{section}:{iid}:u+')])
         elif r['rule']=='hours':
-            buttons.append([('➖',f'adj:{section}:{iid}:u-'),(f'{r["name"][:19]} · {r["units"]} ч.', 'noop'),('➕',f'adj:{section}:{iid}:u+')])
+            buttons.append([('➖',f'adj:{section}:{iid}:u-'),(f'{r["units"]} ч.', 'noop'),('➕',f'adj:{section}:{iid}:u+')])
             buttons.append([('🗑 Удалить услугу',f'drop:{section}:{iid}')])
         elif r['rule']=='single':
-            buttons.append([('🗑 '+r['name'][:26],f'drop:{section}:{iid}')])
+            buttons.append([('🗑 Удалить позицию',f'drop:{section}:{iid}')])
         else:
-            buttons.append([('➖',f'adj:{section}:{iid}:q-'),(f'{r["name"][:18]} · {r["quantity"]}', 'noop'),('➕',f'adj:{section}:{iid}:q+')])
+            buttons.append([('➖',f'adj:{section}:{iid}:q-'),(f'{r["quantity"]} {r["unit"]}', 'noop'),('➕',f'adj:{section}:{iid}:q+')])
     buttons.extend([[('➕ Добавить позиции','sections')],[('👧 Изменить число детей','children')]])
     if rows:buttons.extend([[('📨 Отправить заявку','submit')],[('🗑 Очистить смету','clearask')]])
     buttons.append([('🔄 Начать всё заново','restartask')]);buttons.append([('🏠 Главное меню','home')])
@@ -238,7 +238,7 @@ async def start(m:Message,state:FSMContext):
     await state.clear()
     if not party(m.from_user.id) or not party(m.from_user.id)['children']:
         await state.set_state(Form.children)
-        return await m.answer('🎉 Сколько детей будет на празднике? (от 1 до 30)')
+        return await m.answer('🎉 Сколько детей будет на празднике? (от 1 до 30)', reply_markup=ForceReply(input_field_placeholder='Число от 1 до 30', selective=True))
     await m.answer('🎉 Выберите всё для праздника:',reply_markup=keyboard([[ (label,f'section:{key}') ] for key,label in SECTIONS]+nav(m.from_user.id)))
 
 @router.message(Command('myid'))
@@ -261,7 +261,7 @@ async def begin(q:CallbackQuery):
 @router.callback_query(F.data=='children')
 async def children(q:CallbackQuery,state:FSMContext):
     await state.set_state(Form.children)
-    await q.message.answer('👧 Сколько детей будет на празднике? (от 1 до 30)')
+    await q.message.answer('👧 Введите количество детей (от 1 до 30):', reply_markup=ForceReply(input_field_placeholder='Число от 1 до 30', selective=True))
     await q.answer()
 
 @router.message(Form.children,F.text)
