@@ -220,25 +220,81 @@ def cart_text(uid,admin=False):
     return '\n'.join(lines),total
 
 def cart_buttons(uid):
-    rows=cart_rows(uid);buttons=[]
-    for number,r in enumerate(rows,1):
-        section,iid=r['section'],r['item_id']
-        # Full names are in message text; each button row carries the matching item number.
-        buttons.append([(f'№{number} · {r["name"][:38]}', 'noop')])
-        if r['rule']=='room':
-            buttons.append([(f'➖ №{number}',f'adj:{section}:{iid}:q-'),(f'👧 {r["quantity"]} дет.',f'noop'),(f'➕ №{number}',f'adj:{section}:{iid}:q+')])
-            buttons.append([('⏱ −30 мин',f'adj:{section}:{iid}:u-'),(f'{r["units"]*30} мин', 'noop'),('⏱ +30 мин',f'adj:{section}:{iid}:u+')])
-        elif r['rule']=='hours':
-            buttons.append([(f'➖ №{number}',f'adj:{section}:{iid}:u-'),(f'{r["units"]} ч.', 'noop'),(f'➕ №{number}',f'adj:{section}:{iid}:u+')])
-            buttons.append([('🗑 Удалить услугу',f'drop:{section}:{iid}')])
-        elif r['rule']=='single':
-            buttons.append([('🗑 Удалить позицию',f'drop:{section}:{iid}')])
-        else:
-            buttons.append([(f'➖ №{number}',f'adj:{section}:{iid}:q-'),(f'{r["quantity"]} {r["unit"]}', 'noop'),(f'➕ №{number}',f'adj:{section}:{iid}:q+')])
-    buttons.extend([[('➕ Добавить позиции','sections')],[('👧 Изменить число детей','children')]])
-    if rows:buttons.extend([[('📨 Отправить заявку','submit')],[('🗑 Очистить смету','clearask')]])
-    buttons.append([('🔄 Начать всё заново','restartask')]);buttons.append([('🏠 Главное меню','home')])
+    """Compact estimate: edit controls live on separate screens."""
+    rows=cart_rows(uid)
+    buttons=[]
+    if rows:
+        buttons.append([('✏️ Изменить смету','cartedit')])
+    buttons.extend([[('➕ Добавить позиции','sections')], [('👧 Изменить число детей','children')]])
+    if rows:
+        buttons.extend([[('📨 Отправить заявку','submit')], [('🗑 Очистить смету','clearask')]])
+    buttons.extend([[('🔄 Начать всё заново','restartask')], [('🏠 Главное меню','home')]])
     return buttons
+
+@router.callback_query(F.data=='cartedit')
+async def cart_edit_list(q:CallbackQuery):
+    rows=cart_rows(q.from_user.id)
+    if not rows:
+        return await show(q,'🧾 Смета пуста.',[[('⬅️ К смете','cart')]])
+    buttons=[]
+    for number,r in enumerate(rows,1):
+        label=f'{number}. {r["name"]}'
+        # Long labels have their own full-width row, no adjacent controls.
+        buttons.append([(label[:60],f'cartitem:{r["section"]}:{r["item_id"]}')])
+    buttons.append([('⬅️ К смете','cart')])
+    await show(q,'✏️ <b>Выберите позицию для изменения</b>',buttons)
+
+@router.callback_query(F.data.startswith('cartitem:'))
+async def cart_edit_item(q:CallbackQuery):
+    _,section,raw=q.data.split(':');iid=int(raw)
+    await render_cart_item(q,section,iid)
+
+async def render_cart_item(q,section,iid):
+    row=next((r for r in cart_rows(q.from_user.id) if r['section']==section and r['item_id']==iid),None)
+    if row is None:
+        return await show(q,'Позиция больше не находится в смете.',[[('⬅️ К списку','cartedit')]])
+    if row['rule']=='room':
+        detail=f'{row["quantity"]} детей, {row["units"]*30} минут'
+        buttons=[ [('➖ 1 ребёнок',f'editadj:{section}:{iid}:q-'),(f'{row["quantity"]} чел.','noop'),('➕ 1 ребёнок',f'editadj:{section}:{iid}:q+')],
+                  [('⏱ −30 мин',f'editadj:{section}:{iid}:u-'),(f'{row["units"]*30} мин','noop'),('⏱ +30 мин',f'editadj:{section}:{iid}:u+')] ]
+    elif row['rule']=='hours':
+        detail=f'{row["units"]} ч.'
+        buttons=[[('➖ 1 час',f'editadj:{section}:{iid}:u-'),(f'{row["units"]} ч.','noop'),('➕ 1 час',f'editadj:{section}:{iid}:u+')]]
+    elif row['rule']=='single':
+        detail='1 услуга';buttons=[]
+    else:
+        detail=f'{row["quantity"]} {row["unit"]}'
+        buttons=[[('➖',f'editadj:{section}:{iid}:q-'),(detail,'noop'),('➕',f'editadj:{section}:{iid}:q+')]]
+    buttons.extend([[('🗑 Удалить позицию',f'editdrop:{section}:{iid}')], [('⬅️ К списку позиций','cartedit')], [('🧾 К смете','cart')]])
+    msg=f'✏️ <b>{escape(row["name"])}</b>\n{escape(detail)}\nСтоимость: <b>{line_sum(row)} ₽</b>'
+    await show(q,msg,buttons)
+
+@router.callback_query(F.data.startswith('editadj:'))
+async def cart_edit_adjust(q:CallbackQuery):
+    _,section,raw,action=q.data.split(':');iid=int(raw);uid=q.from_user.id
+    with db() as c:
+        r=c.execute('SELECT quantity,units FROM cart_v2 WHERE user_id=? AND section=? AND item_id=?',(uid,section,iid)).fetchone()
+        if not r:return await show(q,'Позиция уже удалена.',[[('⬅️ К списку','cartedit')]])
+        field='units' if action.startswith('u') else 'quantity'
+        value=r[field]+(1 if action.endswith('+') else -1)
+        if value<=0:
+            if field=='quantity':
+                c.execute('DELETE FROM cart_v2 WHERE user_id=? AND section=? AND item_id=?',(uid,section,iid))
+            else:
+                return await q.answer('Нельзя уменьшить ниже базового времени',show_alert=True)
+        else:
+            c.execute(f'UPDATE cart_v2 SET {field}=?,follow_children=CASE WHEN ?="quantity" THEN 0 ELSE follow_children END WHERE user_id=? AND section=? AND item_id=?',(value,field,uid,section,iid))
+    if value<=0 and field=='quantity':
+        return await show(q,'Позиция удалена.',[[('⬅️ К списку','cartedit')], [('🧾 К смете','cart')]])
+    # Refresh the same editor rather than dumping the user back into the full estimate.
+    await render_cart_item(q,section,iid)
+
+@router.callback_query(F.data.startswith('editdrop:'))
+async def cart_edit_drop(q:CallbackQuery):
+    _,section,raw=q.data.split(':')
+    with db() as c:
+        c.execute('DELETE FROM cart_v2 WHERE user_id=? AND section=? AND item_id=?',(q.from_user.id,section,int(raw)))
+    await show(q,'✏️ Позиция удалена.',[[('⬅️ К списку','cartedit')], [('🧾 К смете','cart')]])
 
 @router.callback_query(F.data=='noop')
 async def noop(q:CallbackQuery):await q.answer()
