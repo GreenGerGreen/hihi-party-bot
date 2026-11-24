@@ -9,6 +9,10 @@ Environment:
 '''
 
 import asyncio
+import hashlib
+import hmac
+import json
+from urllib.parse import parse_qsl
 import logging
 import os
 import re
@@ -107,6 +111,7 @@ class LineItem(BaseModel):
     unit: str = Field(default='шт.', max_length=35)
     price: float = Field(default=0, ge=0, le=10_000_000)
     blocks: int = Field(default=1, ge=1, le=1000)
+    extraHours: int = Field(default=0, ge=0, le=100)
 
 
 class Application(BaseModel):
@@ -118,6 +123,11 @@ class Application(BaseModel):
     kids: int = Field(default=0, ge=0, le=100)
     items: list[LineItem] = Field(default_factory=list, max_length=120)
     total: float = Field(default=0, ge=0, le=50_000_000)
+    telegram_init_data: str = Field(default='', max_length=10000)
+    birthday_name: str = Field(default='', max_length=80)
+    birthday_age: int | None = Field(default=None, ge=1, le=99)
+    adult_guests: int | None = Field(default=None, ge=1, le=150)
+    estimated_minutes: int = Field(default=0, ge=0, le=20000)
 
 
 def format_money(value: float) -> str:
@@ -180,6 +190,46 @@ def format_section_lines(items: list[LineItem]) -> list[str]:
     return lines
 
 
+def estimate_event_duration(a: Application) -> int:
+    """Minimum two hours; playroom and booked discos run sequentially.
+
+    Face painting and glitter tattoos can run during games and add no time.
+    Unbooked complimentary entertainment is not counted or disclosed.
+    """
+    meal_minutes = 30 if any(item_section(x) in ('child','adult') and not x.name.strip().startswith('Аренда') for x in a.items) else 0
+    sequential = 0
+    playroom = 0
+    paid_discos = 0
+    for x in a.items:
+        if item_section(x) != 'fun':
+            continue
+        n, blocks = x.name.strip(), x.blocks
+        if n in ('Аквагрим', 'Блеск-тату'):
+            continue
+        if n == 'Игровая комната':
+            playroom = max(playroom, 30 * blocks)
+        elif n in ('Дискотека с мыльными пузырями', 'Дискотека с караоке'):
+            paid_discos += 30 * blocks
+        elif n.startswith('Анимационная программа — '):
+            sequential += 60 * (1 + x.extraHours)
+        elif n.startswith('Программы для подростков — '):
+            sequential += 60 * blocks
+        elif n.startswith('Бумажное шоу') or n in ('Поролоновое шоу', 'Шоу мыльных пузырей'):
+            sequential += 30 * blocks
+        elif n in ('Мафия', 'Настольные игры'):
+            sequential += 60 * blocks
+        elif n.startswith('Аренда помещения для своих аниматоров/ведущих'):
+            sequential += 60 * x.qty
+    activities = sequential + playroom + paid_discos
+    raw_minutes = activities + meal_minutes
+    return max(120, ((raw_minutes + 29) // 30) * 30)
+
+
+def time_text(minutes: int) -> str:
+    h, m = divmod(minutes, 60)
+    return f'{h} ч {m} мин' if h and m else f'{h} ч' if h else f'{m} мин'
+
+
 def format_application(a: Application) -> str:
     title = {'order': '🧾 Новая заявка «Хи-Хи»',
              'callback': '📞 Заказ обратного звонка',
@@ -189,6 +239,9 @@ def format_application(a: Application) -> str:
     if a.type == 'date':
         parts.append(f'📆 Дата: {escape(a.date)}')
     if a.type == 'order':
+        parts.append(f'🎂 Именинник: {escape(a.birthday_name)} · {a.birthday_age} лет')
+        if a.adult_guests is not None:
+            parts.append(f'👥 Взрослых гостей: {a.adult_guests} чел. (для сервировки)')
         labels = [('child', '🍕 Детский стол'),
                   ('adult', '☕ Взрослый стол'),
                   ('fun', '🎉 Развлечения'),
@@ -205,9 +258,66 @@ def format_application(a: Application) -> str:
             parts.extend(['', f'<b>{heading}</b>'])
             parts.extend(format_section_lines(selected))
             parts.append(f"<i>Подытог: {format_money(sum(item_amount(i) for i in selected))} ₽</i>")
+        minutes = estimate_event_duration(a)
+        parts.append('')
+        parts.append(f'🕒 <b>Ориентировочная длительность: {time_text(minutes)}</b>')
+        parts.append('<i>Время начала и окончания согласовывается при подтверждении заявки.</i>')
         parts.extend(['', f'💰 <b>Итого по смете: {format_money(a.total)} ₽</b>',
                       '<i>Сумма и цены переданы сайтом, перед подтверждением перепроверьте заказ.</i>'])
     return '\n'.join(parts)
+
+
+def verified_telegram_user(init_data: str) -> int | None:
+    """Validate Telegram.WebApp.initData HMAC before using user.id for notifications.
+
+    Ref: https://core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app
+    """
+    if not init_data:
+        return None
+    try:
+        pairs = parse_qsl(init_data, keep_blank_values=True, strict_parsing=True)
+        values = dict(pairs)
+        if len(pairs) != len(values):
+            return None
+        received_hash = values.pop('hash', '')
+        if len(received_hash) != 64:
+            return None
+        auth_time = int(values.get('auth_date', '0'))
+        now = int(time.time())
+        # One day is enough for orders, with limited clock skew.
+        if auth_time < now - 86400 or auth_time > now + 300:
+            return None
+        check_string = '\n'.join(f'{key}={value}' for key,value in sorted(values.items()))
+        secret = hmac.new(b'WebAppData', TOKEN.encode('utf-8'), hashlib.sha256).digest()
+        expected_hash = hmac.new(secret, check_string.encode('utf-8'), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(received_hash, expected_hash):
+            return None
+        user = json.loads(values.get('user', '{}'))
+        user_id = user.get('id')
+        if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0:
+            return None
+        return user_id
+    except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+        return None
+
+
+def format_client_receipt(a: Application, order_id: int) -> str:
+    """Use the same grouped items as admin, in polite client-facing wording."""
+    heading = '🎉 <b>«Хи-Хи» · Ваша заявка</b>'
+    details = format_application(a).split('\n')
+    # First line is admin-only «Новая заявка»; remaining fields and grouped estimate are identical.
+    # Client receives only the total estimated duration, never the internal breakdown.
+    estimate = '\n'.join(
+        line for line in details[1:]
+        if 'Взрослых гостей:' not in line
+    )
+    estimate = estimate.replace(
+        '<i>Сумма и цены переданы сайтом, перед подтверждением перепроверьте заказ.</i>',
+        '<i>Итоговая стоимость будет подтверждена администратором.</i>'
+    )
+    return (heading+'\n✅ <b>Статус: В работе</b>\n'
+            'Мы получили вашу заявку и свяжемся с вами для подтверждения деталей.\n\n'
+            +estimate)
 
 
 def within_rate_limit(ip: str):
@@ -278,10 +388,18 @@ async def submit(data: Application, request: Request):
     within_rate_limit(ip)
     if len([x for x in data.phone if x.isdigit()]) < 7:
         raise HTTPException(422, 'Некорректный телефон')
-    if data.type=='order' and not data.items:
-        raise HTTPException(422, 'Смета пуста')
+    if data.type=='order':
+        if not data.items:
+            raise HTTPException(422, 'Смета пуста')
+        if not data.birthday_name.strip() or data.birthday_age is None:
+            raise HTTPException(422, 'Укажите имя и возраст именинника')
+        if any(item_section(item)=='adult' for item in data.items) and data.adult_guests is None:
+            raise HTTPException(422, 'Укажите количество взрослых гостей')
     if data.type=='date' and not data.date.strip():
         raise HTTPException(422, 'Не указана дата')
+    client_id = verified_telegram_user(data.telegram_init_data)
+    if data.telegram_init_data and client_id is None:
+        raise HTTPException(401, 'Telegram-сессия недействительна. Откройте конструктор через бота заново.')
     message = format_application(data)
     if len(message)>3950:
         raise HTTPException(413, 'Слишком длинная заявка')
@@ -299,7 +417,15 @@ async def submit(data: Application, request: Request):
         raise HTTPException(502, 'Заявка сохранена, но уведомление пока не доставлено')
     with open_db() as conn:
         conn.execute('UPDATE orders SET delivered=1 WHERE id=?',(order_id,))
-    return {'ok': True, 'id': order_id}
+    client_notified = False
+    if data.type == 'order' and client_id is not None:
+        try:
+            await bot.send_message(client_id, format_client_receipt(data, order_id), parse_mode='HTML')
+            client_notified = True
+        except Exception:
+            # Keep owner notifications working even if the client blocked the bot.
+            logger.exception('Client receipt failed for order %s user %s', order_id, client_id)
+    return {'ok': True, 'id': order_id, 'client_notified': client_notified}
 
 
 if __name__ == '__main__':
