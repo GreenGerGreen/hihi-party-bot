@@ -11,6 +11,7 @@ Environment:
 import asyncio
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -100,6 +101,8 @@ def recipient_id() -> int:
 class LineItem(BaseModel):
     model_config = ConfigDict(extra='ignore')
     name: str = Field(min_length=1, max_length=170)
+    kind: str = Field(default="", max_length=20)
+    id: str = Field(default="", max_length=200)
     qty: int = Field(default=1, ge=1, le=1000)
     unit: str = Field(default='шт.', max_length=35)
     price: float = Field(default=0, ge=0, le=10_000_000)
@@ -117,19 +120,93 @@ class Application(BaseModel):
     total: float = Field(default=0, ge=0, le=50_000_000)
 
 
+def format_money(value: float) -> str:
+    """Whole-ruble amounts remain easy to read in Telegram."""
+    return f'{value:,.0f}'.replace(',', ' ') if float(value).is_integer() else f'{value:,.2f}'.replace(',', ' ').replace('.', ',')
+
+
+def item_section(item: LineItem) -> str:
+    """New frontend sends kind; old carts can be recognized from the item ID."""
+    kind = (item.kind or item.id.split('|', 1)[0]).lower()
+    return kind if kind in {'child', 'adult', 'fun', 'decor'} else 'other'
+
+
+def item_display(item: LineItem) -> tuple[str, str]:
+    """Group pizza by diameter; juices/water by volume, without losing varieties."""
+    name = item.name.strip()
+    pizza = re.fullmatch(r'Пицца\s+[«"](.+?)[»"]\s*,\s*(\d+)\s*см', name, re.I)
+    if pizza:
+        return f'Пицца {pizza.group(2)} см', pizza.group(1).strip()
+    drink = re.fullmatch(r'(Сок|Вода)\s+(.+?)\s*,\s*([\d,.]+)\s*л', name, re.I)
+    if drink:
+        return f'{drink.group(1).capitalize()} {drink.group(3)} л', drink.group(2).strip()
+    return name, ''
+
+
+def item_amount(item: LineItem) -> float:
+    return item.qty * item.price * item.blocks
+
+
+def format_section_lines(items: list[LineItem]) -> list[str]:
+    # Python dictionaries preserve the order in which the customer selected products.
+    groups = {}
+    for item in items:
+        label, flavor = item_display(item)
+        key = (label.casefold(), item.unit.casefold(), item.blocks)
+        if key not in groups:
+            groups[key] = {'label': label, 'unit': item.unit.strip() or 'шт.',
+                           'qty': 0, 'sum': 0.0, 'blocks': item.blocks, 'flavors': {}}
+        group = groups[key]
+        group['qty'] += item.qty
+        group['sum'] += item_amount(item)
+        if flavor:
+            group['flavors'][flavor] = group['flavors'].get(flavor, 0) + item.qty
+    lines = []
+    for g in groups.values():
+        unit = g['unit']
+        if g['label'].startswith('Пицца '):
+            unit = 'шт.'
+        elif g['label'].startswith(('Сок ', 'Вода ')):
+            unit = 'шт.'
+        quantity = f"{g['qty']} {unit}"
+        if g['blocks'] > 1:
+            quantity += f" × {g['blocks']}"  # For multi-block services/room use
+        flavors = g['flavors']
+        variation = ''
+        if flavors:
+            varying = any(q > 1 for q in flavors.values())
+            variation = ' (' + ', '.join(f'{f} ×{q}' if varying else f for f,q in flavors.items()) + ')'
+        lines.append(f"• {escape(g['label'])} — {escape(quantity)}{escape(variation)} — {format_money(g['sum'])} ₽")
+    return lines
+
+
 def format_application(a: Application) -> str:
-    title = {'order':'🧾 Новая заявка «Хи-Хи»', 'callback':'📞 Заказ обратного звонка', 'date':'📅 Запрос даты праздника'}[a.type]
+    title = {'order': '🧾 Новая заявка «Хи-Хи»',
+             'callback': '📞 Заказ обратного звонка',
+             'date': '📅 Запрос даты праздника'}[a.type]
     parts = [f'<b>{title}</b>', f'👤 Имя: {escape(a.name.strip())}',
              f'📱 Телефон: {escape(a.phone.strip())}']
     if a.type == 'date':
         parts.append(f'📆 Дата: {escape(a.date)}')
     if a.type == 'order':
-        parts.append(f'👶 Детей: {a.kids}')
-        parts.append('🍰 <b>Выбрано:</b>')
-        for it in a.items:
-            parts.append(f'• {escape(it.name)} — {it.qty} {escape(it.unit)} · {it.price:g} ₽')
-        parts.append(f'💰 <b>Итого по смете клиента: {a.total:g} ₽</b>')
-        parts.append('<i>Сумма передана сайтом, перед подтверждением перепроверьте её.</i>')
+        labels = [('child', '🍕 Детский стол'),
+                  ('adult', '☕ Взрослый стол'),
+                  ('fun', '🎉 Развлечения'),
+                  ('decor', '🎈 Оформление'),
+                  ('other', '📦 Другие позиции')]
+        sections = {key: [] for key, _ in labels}
+        for item in a.items:
+            sections[item_section(item)].append(item)
+        for key, label in labels:
+            selected = sections[key]
+            if not selected:
+                continue
+            heading = label + (f': {a.kids} чел.' if key == 'child' and a.kids else ':')
+            parts.extend(['', f'<b>{heading}</b>'])
+            parts.extend(format_section_lines(selected))
+            parts.append(f"<i>Подытог: {format_money(sum(item_amount(i) for i in selected))} ₽</i>")
+        parts.extend(['', f'💰 <b>Итого по смете: {format_money(a.total)} ₽</b>',
+                      '<i>Сумма и цены переданы сайтом, перед подтверждением перепроверьте заказ.</i>'])
     return '\n'.join(parts)
 
 
