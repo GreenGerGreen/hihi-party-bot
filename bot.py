@@ -2,7 +2,7 @@
 
 Environment:
  BOT_TOKEN: existing Telegram bot token (secret)
- OWNER_ID: first recipient Telegram user ID (default configured below)
+ ORDER_RECIPIENT_ID: order recipient (default @cafehihi, ID 2003369826)
  MINI_APP_URL: https://greengergreen.github.io/hihi-miniapp/
  PORT: Bothost HTTPS proxy internal port (default 3000)
  DB_PATH: optional persistent path for SQLite (for orders and recipient management)
@@ -97,9 +97,8 @@ def setup_db():
 
 
 def recipient_id() -> int:
-    with open_db() as conn:
-        row = conn.execute("SELECT value FROM settings WHERE key='telegram_recipient'").fetchone()
-    return int(row['value']) if row else OWNER_ID
+    """Destination for new café applications; configurable on Bothost."""
+    return int(os.getenv('ORDER_RECIPIENT_ID', '2003369826'))
 
 
 class LineItem(BaseModel):
