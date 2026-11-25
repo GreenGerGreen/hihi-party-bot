@@ -217,7 +217,7 @@ def estimate_event_duration(a: Application) -> int:
             sequential += 30 * blocks
         elif n in ('Мафия', 'Настольные игры'):
             sequential += 60 * blocks
-        elif n.startswith('Аренда помещения для своих аниматоров/ведущих'):
+        elif n in ('Аренда помещения','Аренда для своего аниматора') or n.startswith('Аренда помещения для своих аниматоров/ведущих'):
             sequential += 60 * x.qty
     activities = sequential + playroom + paid_discos
     raw_minutes = activities + meal_minutes
@@ -392,8 +392,6 @@ async def submit(data: Application, request: Request):
             raise HTTPException(422, 'Смета пуста')
         if not data.birthday_name.strip() or data.birthday_age is None:
             raise HTTPException(422, 'Укажите имя и возраст именинника')
-        if any(item_section(item)=='adult' for item in data.items) and data.adult_guests is None:
-            raise HTTPException(422, 'Укажите количество взрослых гостей')
     if data.type=='date' and not data.date.strip():
         raise HTTPException(422, 'Не указана дата')
     client_id = verified_telegram_user(data.telegram_init_data)
